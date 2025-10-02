@@ -60,7 +60,12 @@ function webhookRouter() {
         const session = event.data.object;
         const db = getDb();
 
-        const userId = session.metadata?.userId || '';
+        let userId = session.metadata?.userId || '';
+if (!userId) {
+  const email = (session.customer_details?.email || '').trim().toLowerCase();
+  if (email) userId = email; // fallback to email as userId
+}
+
         const total = Number(session.amount_total || 0);
         const price = Number(config.pricePerEntry || 700);
         let entries = Number(session.metadata?.entriesPurchased || 0);
@@ -143,6 +148,70 @@ function webhookRouter() {
       res.status(500).json({ error: 'Internal server error' });
     }
   });
+  // If not already present above, include this helper in webhookRouter():
+function requireAdmin(req, res) {
+  const token = req.headers['x-admin-token'] || req.query.token;
+  const expected = process.env.ADMIN_TOKEN || config.adminToken;
+  if (!expected || token !== expected) {
+    res.status(401).json({ error: 'unauthorized' });
+    return false;
+  }
+  return true;
+}
+
+// --- Admin: manual ticket credit (ONE-OFF backfill) ---
+router.post('/admin/tickets/credit', express.json(), async (req, res) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const { userId, entries } = req.body || {};
+    const n = Number(entries);
+    if (!userId || !Number.isFinite(n) || n < 1) {
+      return res.status(400).json({ error: 'userId and positive entries required' });
+    }
+
+    const db = getDb();
+
+    // Update tickets
+    const existing = await db.collection('tickets').findOne({ userId });
+    const newTotal = (existing?.tickets || 0) + n;
+    await db.collection('tickets').updateOne(
+      { userId },
+      { $set: { tickets: newTotal } },
+      { upsert: true }
+    );
+
+    // Add a "manual" payment record for audit
+    const paymentId = `manual_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+    await db.collection('payments').insertOne({
+      paymentId,
+      userId,
+      entries: n,
+      amount: n * Number(config.pricePerEntry || 700),
+      timestamp: new Date(),
+      source: 'manual',
+    });
+
+    // Optional audit row (so /admin/webhooks/recent shows it)
+    try {
+      await db.collection('webhook_events').insertOne({
+        eventId: paymentId,
+        type: 'manual.credit',
+        sessionId: null,
+        userId,
+        amount: n * Number(config.pricePerEntry || 700),
+        entries: n,
+        via: 'admin',
+        receivedAt: new Date(),
+      });
+    } catch (_) {}
+
+    res.json({ ok: true, userId, added: n, totalTickets: newTotal, paymentId });
+  } catch (err) {
+    console.error('/api/admin/tickets/credit error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
   return router;
 }
